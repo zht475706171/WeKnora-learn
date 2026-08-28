@@ -38,9 +38,9 @@ WeKnora-learn/
 18. `notes/18-全流程纠错与三层数字差异.md` —— 全流程纠错 + 256/128/无差异
 19. `notes/19-保护机制7500硬切详解.md` —— 7500 硬切(切成什么、是不是单独 chunk)
 
-### 阶段 3:向量化与入库(刚讲完,未落盘)
+### 阶段 3:向量化与入库(已讲,未落盘)
 
-- C 链路已讲清:清理旧数据 → 构造 DB Chunk → 写 chunks 表 → 构造 IndexInfo → BatchIndex → 向量库 → 更新状态
+- 链路:清理旧数据 → 构造 DB Chunk → 写 chunks 表 → 构造 IndexInfo → BatchIndex → 向量库 → 更新状态
 - 关键:chunks 表 ALWAYS 写;向量化内容 = 文档标题 + 面包屑 + 正文;parent 不进向量库
 
 ## 当前进度
@@ -53,11 +53,32 @@ WeKnora-learn/
 🚧 **待落盘**:
 - 向量化与入库的笔记(讲了 6 步链路 + 3 层拼接 + parent 不进向量库 + 3 个中断检查点)
 
-⏳ **还没进行**:
-- **F. 父子分块(SplitTextParentChild)** —— parentSize=4096 / childSize=384,切分阶段的另一种策略,在向量化之前。parent 进 chunks 表不进向量库,child 进向量库,检索时 child 拉父扩上下文
-- **D. 检索与后处理 enrichment** —— 查到 chunk 后怎么加工给 LLM
-- **E. 端到端走一个具体场景** —— 拿真实文档从体检到检索全跑一遍
-- 后续:知识图谱 / 摘要生成 / Wiki / FAQ / 多模态(图片 OCR/Caption)/ 检索后处理 / 答案生成 等
+⏳ **还没进行(按后续讲解顺序)**:
+
+1. **父子分块(SplitTextParentChild)** —— 切分阶段的另一种策略,跟普通 SplitText 二选一(由 `EnableParentChild` 开关决定)。parentSize=4096 / childSize=384,内部还是调 SplitText(切两次:先切 parent,再对每个 parent 切 child)。parent 进 chunks 表不进向量库,child 进向量库,检索时 child 拉父扩上下文。**在向量化之前讲,补上阶段 2 的最后一块**
+2. **向量化与入库落盘** —— 把阶段 3 讲过的内容整理成笔记 21
+3. **检索与后处理 enrichment** —— 查到 chunk 后怎么加工给 LLM
+4. **端到端走一个具体场景** —— 拿真实文档从体检到检索全跑一遍
+5. 后续:知识图谱 / 摘要生成 / Wiki / FAQ / 多模态(图片 OCR/Caption)/ 检索后处理 / 答案生成 等
+
+## 切分阶段两条路线(阶段 2 总结)
+
+```
+切分阶段(由 EnableParentChild 开关二选一):
+
+  路线 A(EnableParentChild=false):普通分块
+    └─ SplitText(text, cfg) → 内部走 Tier 1/2/3
+    → 产出一套 chunk(都进向量库)
+
+  路线 B(EnableParentChild=true):父子分块
+    └─ SplitTextParentChild(text, parentCfg, childCfg)
+         ├─ SplitText(text, parentCfg)        // 切 parent(4096)
+         └─ 对每个 parent:
+              └─ SplitText(parent, childCfg)  // 切 child(384)
+    → 产出 parent(不进向量库)+ child(进向量库)
+```
+
+**关键**:两条路线都用 SplitText,区别只是切一次还是切两次。父子分块不是独立算法,是"在普通切分外面套一层"。
 
 ## 我们怎么学
 
