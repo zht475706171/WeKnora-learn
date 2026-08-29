@@ -37,29 +37,31 @@ WeKnora-learn/
 17. `notes/17-rune偏移是什么意思.md` —— rune vs 字节 vs 行号
 18. `notes/18-全流程纠错与三层数字差异.md` —— 全流程纠错 + 256/128/无差异
 19. `notes/19-保护机制7500硬切详解.md` —— 7500 硬切(切成什么、是不是单独 chunk)
+20. `notes/20-父子分块SplitTextParentChild详解.md` —— 父子分块(跟 Tier1-3 区别、为什么要两层、全流程 8 步、切点与大小分离)
+21. `notes/21-父子分块优化分析与检索双路径.md` —— 父块强塞噪声诊断、自动/Agent 双检索路径、为什么不推荐 LLM 摘要、3 个真正优化方向
 
-### 阶段 3:向量化与入库(已讲,未落盘)
+### 阶段 3:向量化与入库
 
-- 链路:清理旧数据 → 构造 DB Chunk → 写 chunks 表 → 构造 IndexInfo → BatchIndex → 向量库 → 更新状态
-- 关键:chunks 表 ALWAYS 写;向量化内容 = 文档标题 + 面包屑 + 正文;parent 不进向量库
+22. `notes/22-向量化与入库全流程.md` —— processChunks 12 步(幂等清理→建DB Chunk→写chunks表→3层拼接IndexInfo→BatchIndex批量embed→异步后处理→三态状态机)、隐藏的二次 BatchIndex(问题生成)
+23. `notes/23-知识图谱后处理与Neo4j存储原理.md` —— 图谱抽实体+关系存Neo4j、图库vs关系库、定长记录偏移寻址+关系双向链表、index-free adjacency、apoc.merge去重+union累加chunks+Label按KB隔离
+24. `notes/24-Wiki后处理与存储及并发控制.md` —— wiki存PG不进向量库、Map-Reduce流水线LLM生成内容、slug/SourceRefs/链接、图谱vs wiki并发根本区别(累加vs重写)、三重防护(claiming+per-slug悲观锁+乐观锁)、为什么悲观+乐观互补、冲突不能跳过LLM
 
 ## 当前进度
 
 ✅ **已完成**:
 - 阶段 1:架构与文档解析(笔记 01-02)
-- 阶段 2:切块(笔记 03-19,完整覆盖 Tier 1/2/3 + 体检 + overlap + 保护区间 + rune + 7500 硬切)
-- 阶段 3:向量化与入库(已讲,未落盘笔记)
+- 阶段 2:切块(笔记 03-21,完整覆盖 Tier 1/2/3 + 体检 + overlap + 保护区间 + rune + 7500 硬切 + 父子分块 + 父子分块优化分析)—— **阶段 2 收尾,两条切分路线(普通 SplitText / 父子分块)都讲透,含优化方向**
+- 阶段 3:向量化与入库(笔记 22)—— **阶段 3 闭环,入库 12 步全流程 + 二次 BatchIndex + 三态状态机**
+- 后处理:知识图谱(笔记 23,Neo4j 存储)+ Wiki(笔记 24,存储与并发控制)—— **入库后 4 大异步后处理讲透 2 个(图谱/wiki),含图谱vs wiki 并发模型根本区别**
 
 🚧 **待落盘**:
-- 向量化与入库的笔记(讲了 6 步链路 + 3 层拼接 + parent 不进向量库 + 3 个中断检查点)
+- (暂无)
 
 ⏳ **还没进行(按后续讲解顺序)**:
 
-1. **父子分块(SplitTextParentChild)** —— 切分阶段的另一种策略,跟普通 SplitText 二选一(由 `EnableParentChild` 开关决定)。parentSize=4096 / childSize=384,内部还是调 SplitText(切两次:先切 parent,再对每个 parent 切 child)。parent 进 chunks 表不进向量库,child 进向量库,检索时 child 拉父扩上下文。**在向量化之前讲,补上阶段 2 的最后一块**
-2. **向量化与入库落盘** —— 把阶段 3 讲过的内容整理成笔记 21
-3. **检索与后处理 enrichment** —— 查到 chunk 后怎么加工给 LLM
-4. **端到端走一个具体场景** —— 拿真实文档从体检到检索全跑一遍
-5. 后续:知识图谱 / 摘要生成 / Wiki / FAQ / 多模态(图片 OCR/Caption)/ 检索后处理 / 答案生成 等
+1. **检索与后处理 enrichment** —— 查到 chunk 后怎么加工给 LLM(笔记 21 已摸过 resolveParentChunks,顺势讲完整检索链路)
+2. **端到端走一个具体场景** —— 拿真实文档从体检到检索全跑一遍
+3. 后续:知识图谱 / 摘要生成 / Wiki / FAQ / 多模态(图片 OCR/Caption)/ 检索后处理 / 答案生成 等
 
 ## 切分阶段两条路线(阶段 2 总结)
 
@@ -78,7 +80,7 @@ WeKnora-learn/
     → 产出 parent(不进向量库)+ child(进向量库)
 ```
 
-**关键**:两条路线都用 SplitText,区别只是切一次还是切两次。父子分块不是独立算法,是"在普通切分外面套一层"。
+**关键**:两条路线都用 SplitText,区别只是切一次还是切两次。父子分块不是独立算法,是"在普通切分外面套一层"。**切点不由 size 定,封口由 size 定,选刀受 size 间接影响**——ChunkSize 只管装箱封口阈值,下刀靠 Tier1/2/3 的 separators/体检/保护区间/7500。详见笔记 20。
 
 ## 我们怎么学
 
