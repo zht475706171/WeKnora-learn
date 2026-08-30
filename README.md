@@ -46,6 +46,12 @@ WeKnora-learn/
 23. `notes/23-知识图谱后处理与Neo4j存储原理.md` —— 图谱抽实体+关系存Neo4j、图库vs关系库、定长记录偏移寻址+关系双向链表、index-free adjacency、apoc.merge去重+union累加chunks+Label按KB隔离
 24. `notes/24-Wiki后处理与存储及并发控制.md` —— wiki存PG不进向量库、Map-Reduce流水线LLM生成内容、slug/SourceRefs/链接、图谱vs wiki并发根本区别(累加vs重写)、三重防护(claiming+per-slug悲观锁+乐观锁)、为什么悲观+乐观互补、冲突不能跳过LLM
 
+### 阶段 4:检索与对话
+
+25. `notes/25-检索全链路.md` —— 9阶段pipeline(query改写→双路并行检索→RRF融合→rerank两阶段粗排精排→merge8步增厚→filter_topk→喂LLM)、cross-encoder rerank、复合分+MMR、无token budget裁剪
+26. `notes/26-对话历史记忆召回改写意图与数据库选型.md` —— 对话历史(取最近N轮+三层压缩+丢弃检索结果原文+Agent KB结果涂黑)、记忆召回(跨会话5kind+常驻无条件+情境RRF混合+显式+蒸馏写入)、query改写意图(一次LLM三任务+9意图路由+@mention)、数据库选型(pgvector+ParadeDB同库+Redis基础设施+Lite)
+27. `notes/27-载入历史对话细讲与优化点.md` —— KnowledgeQA路径载入历史5步(取20行→request_id配对→丢弃RenderedContent+剥think+补图片附件→丢不完整轮→截5轮)+10机制+4优化点(最该做:KnowledgeQA复用Agent压缩闸)
+
 ## 当前进度
 
 ✅ **已完成**:
@@ -53,15 +59,16 @@ WeKnora-learn/
 - 阶段 2:切块(笔记 03-21,完整覆盖 Tier 1/2/3 + 体检 + overlap + 保护区间 + rune + 7500 硬切 + 父子分块 + 父子分块优化分析)—— **阶段 2 收尾,两条切分路线(普通 SplitText / 父子分块)都讲透,含优化方向**
 - 阶段 3:向量化与入库(笔记 22)—— **阶段 3 闭环,入库 12 步全流程 + 二次 BatchIndex + 三态状态机**
 - 后处理:知识图谱(笔记 23,Neo4j 存储)+ Wiki(笔记 24,存储与并发控制)—— **入库后 4 大异步后处理讲透 2 个(图谱/wiki),含图谱vs wiki 并发模型根本区别**
+- 阶段 4:检索与对话(笔记 25-26)—— **RAG "读"侧闭环,检索 9 阶段全链路 + 对话历史/记忆召回/改写意图/数据库选型**
 
 🚧 **待落盘**:
 - (暂无)
 
 ⏳ **还没进行(按后续讲解顺序)**:
 
-1. **检索与后处理 enrichment** —— 查到 chunk 后怎么加工给 LLM(笔记 21 已摸过 resolveParentChunks,顺势讲完整检索链路)
-2. **端到端走一个具体场景** —— 拿真实文档从体检到检索全跑一遍
-3. 后续:知识图谱 / 摘要生成 / Wiki / FAQ / 多模态(图片 OCR/Caption)/ 检索后处理 / 答案生成 等
+1. **端到端走一个具体场景** —— 拿真实文档从体检到检索全跑一遍
+2. 剩余后处理:摘要生成 / FAQ / 多模态(图片 OCR/Caption)/ 答案生成
+3. 用户消化笔记 25-26 后的针对性问题
 
 ## 切分阶段两条路线(阶段 2 总结)
 
