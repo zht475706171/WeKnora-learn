@@ -1,7 +1,7 @@
-# 28 · Agent 路径四道上下文管理闸
+# 27 · Agent 路径四道上下文管理闸
 
 > 用户细问:Agent 路径的 trimCurrentTurnToolResults / Consolidator 怎么做裁剪?展开说一下。
-> 本篇细讲 Agent 路径(`AgentEngine`)在每次 LLM 调用前跑的 4 道上下文管理闸。KnowledgeQA 路径没有这 4 道(笔记 27 讲过,这是笔记 27 优化点②的对照面)。
+> 本篇细讲 Agent 路径(`AgentEngine`)在每次 LLM 调用前跑的 4 道上下文管理闸。KnowledgeQA 路径没有这 4 道(笔记 26 讲过,这是笔记 26 优化点②的对照面)。
 > 配套:`redactHistoryKBResults`(涂黑)和 `CompressContext`(硬截)本篇给框架,留作后续单独深挖。
 
 ---
@@ -178,44 +178,285 @@ total=40000 > 32000,触发。
 
 ---
 
-## 三、redactHistoryKBResults(闸②)框架
+## 三、redactHistoryKBResults(闸②)深挖
 
-位置:`observe.go:686`。
+位置:`observe.go:686` + `observe.go:672-681`(kbToolNames 集合) + `observe.go:704-747`(装配入口)。
 
-### 3.1 做什么
+### 3.1 一句话
 
-遍历**历史轮**(不是当前轮)消息,凡是 `role=tool` 且工具名在 `kbToolNames` 集合(KB 检索类工具)的,把 content 替换成:
+> **Agent 路径装配历史进 LLM context 时,遍历历史轮 tool 消息,凡是工具名在 8 个 KB 类工具集合里的,把 content 整条换成固定占位符 `[Previous retrieval result omitted — knowledge base may have changed. Please perform a fresh search.]`,不删消息不动 assistant,只改 content,配对保留。默认开,`RetainRetrievalHistory=true` 时关闭。**
+
+### 3.2 kbToolNames 集合——8 个 KB 类工具
+
+代码位置:`observe.go:672-681`
+
+```go
+var kbToolNames = map[string]bool{
+    agenttools.ToolKnowledgeSearch:     true,  // knowledge_search 语义搜索
+    agenttools.ToolGrepChunks:          true,  // grep_chunks 关键词搜索
+    agenttools.ToolListKnowledgeChunks: true,  // list_knowledge_chunks 查看文档分块
+    agenttools.ToolQueryKnowledgeGraph: true,  // query_knowledge_graph 查图谱
+    agenttools.ToolGetDocumentInfo:     true,  // get_document_info 文档元信息
+    agenttools.ToolWikiSearch:          true,  // wiki_search 搜 wiki
+    agenttools.ToolWikiReadPage:        true,  // wiki_read_page 读 wiki 页面
+    agenttools.ToolWikiReadSourceDoc:   true,  // wiki_read_source_doc 精读源文档
+}
+```
+
+**8 个工具分两类**:
+- **5 个 chunk/图谱检索类**:knowledge_search / grep_chunks / list_knowledge_chunks / query_knowledge_graph / get_document_info
+- **3 个 wiki 类**:wiki_search / wiki_read_page / wiki_read_source_doc
+
+**共同特征**:结果都包含**知识库内容**(chunks / wiki 页面 / 文档元信息 / 图谱实体),这些内容**可能因 KB 改动而过时**。
+
+**不在集合里的工具**(对比):shell_exec / read_sandbox_file(沙箱)/ web_search / web_fetch(联网)/ database_query / data_analysis / data_schema(数据库)/ read_skill / execute_skill_script(技能)/ search_conversations(历史对话)/ wiki_write_page / wiki_replace_text / wiki_rename_page / wiki_flag_issue(wiki 写操作,结果不是"KB 内容"是"操作结果")。
+
+**设计逻辑**:只涂黑"读取 KB 内容的工具",不涂黑"写操作"或"跟 KB 无关的工具"。
+
+### 3.3 占位符精确语义
+
+代码位置:`observe.go:692`
 
 ```
 [Previous retrieval result omitted — knowledge base may have changed. Please perform a fresh search.]
 ```
 
-**不删消息、不破配对**,只改 content。占位符带行动建议"Please perform a fresh search",明确告诉 LLM "要查重查"。
+**3 段语义**:
+1. **`Previous retrieval result omitted`**——"上一轮检索结果已省略"。明告诉 LLM 这条 tool 消息原来有内容,被故意省略了,不是工具当时就空
+2. **`knowledge base may have changed`**——"知识库可能已经变了"。解释为啥省略:KB 可能被改、被换、被删,旧结果不可信
+3. **`Please perform a fresh search.`**——"请重新搜索"。行动建议,告诉 LLM 要查就重查,别信旧结果
 
-### 3.2 触发时机
+**跟闸①trim 的 marker 对比**:
+- trim marker:`[Tool result compacted: original_bytes=N. Re-run the tool with narrower filters...]`——**体积原因**压缩,暗示"要细节重查"
+- redact 占位符:`[Previous retrieval result omitted — knowledge base may have changed. Please perform a fresh search.]`——**可信度原因**涂黑,暗示"要准确重查"
 
-装配历史进 LLM context 时(`buildMessagesWithLLMContext` observe.go:704),由 `RetainRetrievalHistory` 开关控制:
+两者**都是占位符 + 行动建议**,但动机不同:trim 是"装不下",redact 是"不可信"。
+
+### 3.4 算法核心:遍历+判断+替换,不删消息
+
+代码位置:`observe.go:686-701`
 
 ```go
-if e.config.RetainRetrievalHistory {
-    sanitized = llmContext  // 保留全量历史检索结果
-} else {
-    sanitized = redactHistoryKBResults(llmContext)  // ★默认走涂黑
+func redactHistoryKBResults(llmContext []chat.Message) []chat.Message {
+    redacted := make([]chat.Message, 0, len(llmContext))
+    for _, msg := range llmContext {
+        if msg.Role == "tool" && kbToolNames[msg.Name] {  // ★只动历史轮 KB 类 tool 消息
+            redacted = append(redacted, chat.Message{
+                Role:       msg.Role,                          // 保留 role=tool
+                Content:    "[Previous retrieval result omitted...]",  // ★只改 Content
+                ToolCallID: msg.ToolCallID,                    // 保留 ToolCallID(配对关键)
+                Name:       msg.Name,                          // 保留工具名
+            })
+        } else {
+            redacted = append(redacted, msg)  // 非 KB tool / 非 tool 消息原样保留
+        }
+    }
+    return redacted
 }
 ```
 
-**默认 false → 默认涂黑**。
+**4 个关键保证**:
+1. **只动历史轮 KB 类 tool 消息**——`msg.Role == "tool" && kbToolNames[msg.Name]` 两个条件 AND
+2. **只改 Content**——Role / ToolCallID / Name 全保留
+3. **不删消息**——配对的 assistant(tool_calls) 不动,tool 消息也不删,只换内容
+4. **配对保留**——ToolCallID 保留,LLM provider 看到 assistant 的 tool_calls 仍能找到对应 tool_result
 
-### 3.3 为什么
+**跟闸①trim 一样的"配对不拆"原则**——OpenAI 兼容协议要求每个 tool_call 必须有对应 tool_result,redact 只换 content 不删消息,配对永不破坏。
 
-注释 observe.go:684:
-> This prevents the LLM from reusing stale retrieval data when the knowledge base has been modified or switched between turns.
+**拷贝不原地改**:新建 `redacted` slice,不修改原 `llmContext`。跟 trim 一样,原消息对象还被 SSE/诊断/DB 在用,原地改会污染。
 
-历史轮检索结果可能已过时(KB 被改、chunk 变了、换 KB)。占位符让 LLM "别信旧结果,要查重查",但保留消息骨架让 LLM 知道"上一轮确实调过这个工具、拿到了某种结果"。
+### 3.5 触发时机:装配历史进 context 时,每任务跑一次(不是每 round)
 
-### 3.4 留作深挖
+代码位置:`observe.go:704-747 buildMessagesWithLLMContext`
 
-KB 工具集合具体有哪些、占位符精确语义、跟 KnowledgeQA 丢 RenderedContent 的关系、`RetainRetrievalHistory=true` 的使用场景——本篇不展开,留后续单独深挖。
+```go
+if len(llmContext) > 0 {
+    var sanitized []chat.Message
+    if e.config.RetainRetrievalHistory {
+        sanitized = llmContext                          // ★开关:保留全量历史检索结果
+    } else {
+        sanitized = redactHistoryKBResults(llmContext)  // ★默认:涂黑 KB 工具结果
+    }
+    for _, msg := range sanitized {
+        if msg.Role == "system" { continue }             // ★过滤历史里的 system 消息
+        if msg.Role == "user" || msg.Role == "assistant" || msg.Role == "tool" {
+            messages = append(messages, msg)
+        }
+    }
+}
+```
+
+**触发时机**:每次 Agent 任务开始装配 messages 数组时(`engine.go:277` 调 `buildMessagesWithLLMContext`)。**每个 Agent 任务跑一次**,不是每个 round 跑一次。
+
+**关键区别**:redact 在**装配阶段**跑(任务开始时一次性),不是在 manageContextWindow 里(每 round 跑)。trim/Consolidator/Compress 是每 round 跑,redact 是任务开始时跑一次,后续 round 的 messages 都基于这次装配的结果。
+
+**为啥这样设计**:redact 处理的是**历史轮** tool 消息(从 DB 载入的),历史是固定的(任务开始时载入一次),不需要每 round 重跑。trim 处理**当前轮** tool 消息,当前轮每 round 都有新工具结果,需要每 round 跑。
+
+### 3.6 RetainRetrievalHistory 开关——默认 false 涂黑,true 保留全量
+
+**3 个配置来源**(都有这个字段):
+- `internal/types/agent.go:49`——AgentConfig(运行时配置)
+- `internal/types/custom_agent.go:175`——CustomAgent(YAML 自定义 agent)
+- `internal/types/agent_type_preset.go:60`——AgentTypePresetConfig(agent 类型预设)
+
+**传递链**:CustomAgent.Config.RetainRetrievalHistory → `session_agent_qa.go:296 buildAgentConfig` → AgentConfig.RetainRetrievalHistory → `observe.go:715` 判断
+
+**默认值**:`false`(Go 零值)——**默认涂黑**。
+
+#### 什么场景会开 `RetainRetrievalHistory=true`?(代码无注释,从语义推断 3 种场景)
+
+**场景 1:KB 是只读的,不会变**
+- 比如归档型 KB(历史文档库、固定知识集),上传后只读不删不改
+- 旧检索结果依然可信,涂黑浪费 token 还逼 LLM 重查
+- 开 true 保留全量,LLM 直接复用旧结果省一轮工具调用
+
+**场景 2:多轮追问依赖上一轮检索结果**
+- 用户问"刚才那个 chunk 的第 3 条详细说说"——LLM 需要看上一轮检索结果的第 3 条
+- 涂黑后 LLM 看不到"第 3 条",只能重查,但重查的结果可能跟上一轮不同(检索有随机性或 KB 真变了)
+- 开 true 保留全量,LLM 直接引用上一轮结果
+
+**场景 3:成本敏感,宁可冒陈旧数据风险也要省 token**
+- 涂黑占位符虽然短(~100 字符),但 LLM 看到后可能重查,重查又费一轮工具调用 + 一次 LLM 推理
+- 如果 KB 变化频率低,重查就是浪费
+- 开 true 保留全量,省重查成本,代价是可能用陈旧数据
+
+**默认 false 的理由**:WeKnora 是知识管理平台,KB 随时可能被改(上传新文档/删旧文档/重建索引),默认假设"KB 可能变了"更安全。宁可多查一次也不用陈旧数据。
+
+### 3.7 ★两层处理:redact 之前历史 tool 内容已经被 CompactToolOutputForHistory 压缩过一遍
+
+**这是深挖才发现的关键点**:redact 不是处理"原始工具结果",是处理"已经被压缩过的历史 tool 消息"。
+
+#### 两层处理链
+
+**第 1 层:LoadAgentHistory 载入历史时**(`agent_history.go:225 toolCallOutput`)
+
+```go
+func toolCallOutput(tc types.ToolCall) string {
+    if tc.Result == nil { return "" }
+    if !tc.Result.Success { return "Error: " + tc.Result.Error }
+    return agenttools.CompactToolOutputForHistory(tc.Name, tc.Result)  // ★压缩
+}
+```
+
+`CompactToolOutputForHistory`(`persist.go:143`)对每个工具结果做压缩:
+- `knowledge_chunks_list`(list_knowledge_chunks 结果):`"Listed 20/87 chunks from <title> (content omitted from history)"`——只留"列了多少/总数/标题",chunks 内容全丢
+- `grep_results`(grep_chunks 结果):`"Keyword search found 15 matching chunks across 3 document(s) (details omitted from history)"`——只留"匹配数/文档数",chunk 详情全丢
+- `search_results`(knowledge_search 结果):`"Semantic search returned 5 result(s) (details omitted from history)"`——只留"结果数",结果详情全丢
+- `shell_exec`:头尾 4K 截断(`historicalSandboxOutputChars = 4*1024`),中间用 `...[historical tool output compacted]...` 替代
+- 其他带 `display_type` 的:`"Tool completed (<type>; payload omitted from history)"`
+
+**这一层在 LoadAgentHistory 里跑**,每个历史 tool 消息的 Content 已经是压缩后的短摘要,不是原始工具结果。
+
+**第 2 层:redactHistoryKBResults 装配进 context 时**(`observe.go:686`)
+
+```go
+if msg.Role == "tool" && kbToolNames[msg.Name] {
+    Content: "[Previous retrieval result omitted...]"  // ★再换成占位符
+}
+```
+
+对 8 个 KB 类工具的 tool 消息,**把第 1 层压缩后的短摘要再换成更短的占位符**。
+
+#### 两层处理后的最终形态(数字举例)
+
+round 1 调 `knowledge_search` 返回 5 条 chunk(原始结果 2000 字):
+
+| 阶段 | content | 字节数 |
+|---|---|---|
+| 原始工具结果(当前轮 round 1 时) | 完整 5 条 chunk 内容 | 2000 |
+| 第 1 层 CompactToolOutputForHistory(round 2 载入历史时) | `"Semantic search returned 5 result(s) (details omitted from history)"` | 70 |
+| 第 2 层 redactHistoryKBResults(round 2 装配进 context 时) | `"[Previous retrieval result omitted — knowledge base may have changed. Please perform a fresh search.]"` | 100 |
+
+**关键观察**:
+- 第 1 层已经把 2000 字压到 70 字,**信息基本丢了**(只剩"返回 5 条")
+- 第 2 层把 70 字换成 100 字占位符,**字节数反而多了 30 字**
+- 第 2 层的目的**不是省 token**(字节反而多),是**防陈旧**(明告诉 LLM "KB 可能变了,别信")
+
+**两层处理的不同目的**:
+- **第 1 层 CompactToolOutputForHistory**:**省 token**——历史 tool 结果详情不需要带进 LLM context,带个摘要够了
+- **第 2 层 redactHistoryKBResults**:**防陈旧**——连摘要都不让 LLM 信,因为 KB 可能变了
+
+**两层叠加的效果**:KB 类工具的历史结果,LLM 看到的是"上一轮查过但结果不可信,要查重查",既省 token 又防陈旧。
+
+#### 为啥不直接用第 2 层,要两层?
+
+第 1 层在 **DB 持久化时**就跑了(`SanitizeAgentStepsForStorage` `persist.go:107`),DB 里存的已经是压缩后的版本。LoadAgentHistory 从 DB 读出来就是压缩后的,redact 是在压缩后的基础上再换占位符。
+
+**持久化时压缩的原因**:
+- DB 存全量 tool 结果太占空间(一个 knowledge_search 结果可能几 KB,几百轮历史就是几 MB)
+- SSE 重放也不需要全量(前端只要知道"这一步查了 5 条"就够渲染卡片)
+- 持久化压缩 + 载入时复用 = DB 省空间 + 内存省空间
+
+**所以两层是不同阶段的处理**:
+- 持久化阶段(`SanitizeAgentStepsForStorage`):全量 → 摘要(存 DB 省空间)
+- 载入阶段(`LoadAgentHistory` → `CompactToolOutputForHistory`):摘要 → 摘要(从 DB 读出来就是摘要)
+- 装配阶段(`redactHistoryKBResults`):摘要 → 占位符(防陈旧)
+
+redact 是第 3 阶段,处理的是已经被第 1 阶段压缩过的内容。
+
+### 3.8 跟 KnowledgeQA 丢 RenderedContent 的关系
+
+笔记 26 讲过 KnowledgeQA 路径载入历史时**丢弃 RenderedContent**(common.go:163-168),redact 跟它的关系是**两条路径各自处理历史检索结果,但处理对象和方式不同**:
+
+| 维度 | KnowledgeQA 丢 RenderedContent | Agent redactHistoryKBResults |
+|---|---|---|
+| **路径** | KnowledgeQA(chat_pipeline) | Agent(AgentEngine) |
+| **处理对象** | user 消息的 RenderedContent 字段(检索结果快照) | tool 消息的 Content 字段(工具结果) |
+| **处理方式** | **直接丢弃**(不读这个字段) | **换占位符**(保留消息骨架,换内容) |
+| **触发时机** | LoadHistory 阶段(common.go:145 loadAndProcessHistory) | buildMessagesWithLLMContext 阶段(observe.go:704) |
+| **为啥处理** | RenderedContent 是旧协议快照(`<context id="...">` 信封),混进当前协议会污染 | KB 工具结果可能因 KB 改动而过时 |
+| **能否关闭** | 不能(硬编码丢弃) | 能(`RetainRetrievalHistory=true` 关闭) |
+| **历史结构** | 一轮 = user + assistant 两条(无 tool 消息) | 一轮 = user + assistant(tool_calls) + tool 多条 |
+
+**关键差异**:
+
+1. **KnowledgeQA 没有 tool 消息**——它是单轮单次 RAG,检索是代码控制的(不通过 function calling),检索结果塞进 system prompt 的 context 段,不产生 tool 消息。所以 KnowledgeQA 历史里**没有 tool 消息可涂黑**,只能丢 user 消息的 RenderedContent 快照
+
+2. **Agent 有 tool 消息**——它是 LLM 自主调工具,每次调工具产生 assistant(tool_calls) + tool 一对消息,KB 类工具结果在 tool 消息里。redact 处理这些 tool 消息
+
+3. **处理粒度不同**——KnowledgeQA 丢整个 RenderedContent(粗粒度,因为检索结果不是独立消息),Agent 涂黑单个 tool 消息(细粒度,每个工具结果独立处理)
+
+4. **设计哲学一致**——两条路径都认为"历史检索结果可能陈旧,不该让 LLM 直接复用",但处理方式因历史结构不同而不同
+
+**统一视角**:WeKnora 的两条路径**都防陈旧检索结果**,KnowledgeQA 通过丢 RenderedContent(粗粒度),Agent 通过 redactHistoryKBResults(细粒度)。
+
+### 3.9 跟闸①trim 的对比(都是占位符替换,但维度不同)
+
+| 维度 | 闸①trim | 闸②redact |
+|---|---|---|
+| **处理对象** | 当前轮 tool 消息 | 历史轮 KB 类 tool 消息 |
+| **触发条件** | 当前轮 tool 总 token > budget(32K) | 默认每次装配历史都跑(除非 RetainRetrievalHistory=true) |
+| **目的** | 省当前轮 token,保推理空间 | 防陈旧 KB 结果污染 LLM |
+| **替换内容** | marker + 头尾预览(保留部分内容) | 固定占位符(全丢内容) |
+| **可恢复** | 是(LLM 看到 marker 知道"要细节重查") | 是(LLM 看到占位符知道"要准确重查") |
+| **触发频率** | 每 round 跑(当前轮有新工具结果) | 每任务跑一次(装配历史时) |
+| **配对不拆** | ✅ | ✅ |
+| **拷贝不原地改** | ✅ | ✅ |
+
+**两者关系**:trim 管"当前轮体积",redact 管"历史轮可信度",正交不冲突。同一条 tool 消息不可能既被 trim 又被 redact(trim 只动当前轮,redact 只动历史轮)。
+
+### 3.10 失败模式与边界情况
+
+1. **`RetainRetrievalHistory=true` 时 redact 完全不跑**——历史 KB 工具结果全量带进 context,token 消耗大,LLM 可能复用陈旧数据。用户需自己判断 KB 是否只读
+2. **历史轮有非 KB 工具结果(shell_exec 等)**——redact 不碰,但第 1 层 CompactToolOutputForHistory 已经压过(head/tail 4K),进 context 的是压缩版
+3. **★历史轮 KB 工具失败(Error)**——redact 也会涂黑!`if msg.Role == "tool" && kbToolNames[msg.Name]` 只判断 role 和工具名,不判断成功失败。失败的 KB 工具结果也被换成"KB 可能变了请重查",但原本失败的话 LLM 看到"Error: ..."更准确。**潜在小盲区**:redact 没区分成功/失败,失败结果也被涂黑,LLM 失去"上一轮这个工具失败了"的信号
+4. **工具名不在 kbToolNames 但结果其实包含 KB 内容**——比如未来新增的检索类工具没加进 kbToolNames,redact 不会涂黑,可能漏防陈旧。集合需要维护跟工具开发同步
+
+### 3.11 代码位置速查
+
+- kbToolNames 集合:`observe.go:672-681`(8 个 KB 类工具)
+- redactHistoryKBResults 主函数:`observe.go:686-701`
+- 占位符字符串:`observe.go:692`
+- 开关判断:`observe.go:715 RetainRetrievalHistory`
+- 装配入口:`observe.go:704 buildMessagesWithLLMContext`
+- 装配调用点:`engine.go:277`
+- 配置字段:`types/agent.go:49` / `types/custom_agent.go:175` / `types/agent_type_preset.go:60`
+- 配置传递:`session_agent_qa.go:296 buildAgentConfig`
+- 第 1 层压缩:`agent_history.go:225 toolCallOutput` → `persist.go:143 CompactToolOutputForHistory`
+- 持久化压缩:`persist.go:107 SanitizeAgentStepsForStorage`
+- 各工具压缩摘要:`persist.go:263 compactToolSummary`(knowledge_chunks_list / grep_results / search_results / shell_exec / attachment_parsing)
+- 沙箱头尾截断:`persist.go:168 compactHistoricalSandboxOutput`(`historicalSandboxOutputChars = 4*1024`)
+- KnowledgeQA 对比:common.go:163-168 丢 RenderedContent(笔记 26)
 
 ---
 
@@ -538,7 +779,7 @@ remaining = [systemMsg] + groups[removeUpTo:] + tail
 
 ### 5.5 留作深挖
 
-`groupToolMessages` 的精确分组规则、跟 Consolidator findKeepBoundary 分组算法的差异、硬截断的失败模式、跟 KnowledgeQA 复用的具体接入点(笔记 27 优化点②)——本篇不展开,留后续单独深挖。
+`groupToolMessages` 的精确分组规则、跟 Consolidator findKeepBoundary 分组算法的差异、硬截断的失败模式、跟 KnowledgeQA 复用的具体接入点(笔记 26 优化点②)——本篇不展开,留后续单独深挖。
 
 ---
 
@@ -616,7 +857,7 @@ remaining = [systemMsg] + groups[removeUpTo:] + tail
 
 ## 八、深挖补充:4 个边界问题
 
-> 用户研究笔记 28 后追问的 4 个问题,触及 trim 盲区、cache 策略、摘要 prompt、CompressContext 细节。
+> 用户研究笔记 27 后追问的 4 个问题,触及 trim 盲区、cache 策略、摘要 prompt、CompressContext 细节。
 
 ### 8.1 Q1:trimCurrentTurnToolResults 的 3 个盲区
 
@@ -1421,10 +1662,12 @@ Q1/Q2/Q3 收敛到同一个痛点:**Consolidator 重复劳动**——同 session
 
 本篇把 4 道闸 + prompt cache 基础设施全部讲透:
 - 闸①trimCurrentTurnToolResults:第七节深挖 + 第八节 8.1 补充 3 个盲区(单工具无限制/渐进式塞满/头尾预览丢中间)
-- 闸②redactHistoryKBResults:第三节框架
+- 闸②redactHistoryKBResults:第三节深挖(8 个 KB 工具集合 + 占位符语义 + 两层处理 + 跟 KnowledgeQA 丢 RenderedContent 关系 + 跟 trim 对比 + 失败模式)
 - 闸③Consolidator:第四节深挖 + 第八节 8.3 补充 prompt 翻译
 - 闸④CompressContext:第五节框架 + 第八节 8.4 讲透(算法 6 步 + worked example + 跟 Consolidator 对比)
 - ★第九节 stable prefix 机制详解 + Q1/Q2/Q3 三问答 + 更正 8.2/8.3 表述
+
+**4 道闸现在全部讲透**(之前 ②只有框架,本次补全)。
 
 **重要更正(三轮)**:
 1. 8.2 初稿"Agent 引擎不维护 prompt cache"是错的——真实是用了(think.go:42-43 算指纹贴标签),只覆盖 stable prefix(前导 system + tools schema),不覆盖对话历史
@@ -1433,23 +1676,25 @@ Q1/Q2/Q3 收敛到同一个痛点:**Consolidator 重复劳动**——同 session
 4. ★**冻结决策解决不了 summary 字节变的问题**——summary 字节变是"源头问题"(LLM 非确定性),不是"被改问题"。冻结决策是给"会被改的消息"用的,summary 用"摘要落盘复用"解决
 5. ★**claude-code 冻结决策的真正价值是"保住压缩成果不让历史膨胀"**,不是"保 cache 命中"——WeKnora 历史段靠 DB-centered 已保证字节稳定,不需要冻结决策也能命中 cache
 
+**闸②深挖新增发现**:
+- ★**两层处理**:持久化时 CompactToolOutputForHistory 压缩 → 载入时复用压缩版 → 装配时 redact 换占位符。redact 不是处理原始结果,是处理"已压缩摘要"
+- ★**redact 不区分成功/失败**:失败的 KB 工具结果也被涂黑,LLM 失去"上一轮失败了"的信号(潜在小盲区)
+
 **收敛的优化方向**(Q1/Q2/Q3 收敛):Consolidator 摘要落盘 + 下次复用 + CompressContext 优先保留 summary。主收益省 LLM 调用,次防白摘要,顺带 cache 命中率提升。~~把 summary 排出 prefix 段~~ 性价比低去掉。
 
 下次接续方向:
-- 深挖闸②redactHistoryKBResults:kbToolNames 集合具体有哪些、占位符精确语义、跟 KnowledgeQA 丢 RenderedContent 的关系、`RetainRetrievalHistory=true` 的使用场景
-- 评估笔记 27 优化点②(KnowledgeQA 复用 Agent 压缩闸):看完 4 道闸 + cache 基础设施后,判断那个优化点是真该做还是 KnowledgeQA 根本不需要
+- 评估笔记 26 优化点②(KnowledgeQA 复用 Agent 压缩闸):看完 4 道闸 + cache 基础设施 + 两层面拆分后,判断那个优化点是真该做还是 KnowledgeQA 根本不需要
 - 评估第九节收敛的优化方向(Consolidator 摘要落盘)要不要深挖成具体方案
 - Agent 路径其他点:ReAct 循环、工具调度、finalize、approval 等
 - 不要主动继续,等用户提问
 
 ## 十一、下一步建议
 
-用户已研究完 4 道闸(含 8.1-8.4 四个深挖点)+ stable prefix 机制(第九节 Q1/Q2/Q3 + 两层面拆分),可能下一步:
-1. 深挖闸②redactHistoryKBResults(唯一还只有框架的闸)
-2. 重新评估笔记 27 优化点②
-3. 评估第九节收敛的优化方向(Consolidator 摘要落盘)要不要深挖成具体方案
-4. Agent 路径其他点(ReAct 循环、工具调度、finalize 等)
-5. 端到端走具体场景
-6. 剩余后处理(摘要/FAQ/多模态/答案生成)
+用户已研究完 4 道闸全部深挖(含 8.1-8.4 四个深挖点 + 闸②两层处理)+ stable prefix 机制(第九节 Q1/Q2/Q3 + 两层面拆分),可能下一步:
+1. 重新评估笔记 26 优化点②
+2. 评估第九节收敛的优化方向(Consolidator 摘要落盘)要不要深挖成具体方案
+3. Agent 路径其他点(ReAct 循环、工具调度、finalize 等)
+4. 端到端走具体场景
+5. 剩余后处理(摘要/FAQ/多模态/答案生成)
 
 不主动继续,等用户提问。
